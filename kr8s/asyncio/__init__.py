@@ -5,7 +5,7 @@
 This module provides an asynchronous API for interacting with a Kubernetes cluster.
 """
 
-from kr8s._api import Api
+from kr8s._api import AsyncApi as Api
 
 from . import objects, portforward
 from ._api import api

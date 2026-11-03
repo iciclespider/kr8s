@@ -3,7 +3,6 @@
 from collections.abc import Iterable
 from os import PathLike
 from typing import (
-    TYPE_CHECKING,
     Protocol,
     TypeVar,
     Union,
@@ -16,16 +15,6 @@ PathType = Union[
     str,
     "PathLike[str]",  # Can remove quotes when Python 3.9 is the minimum version.
 ]
-
-if TYPE_CHECKING:
-    from ._objects import Pod
-
-
-@runtime_checkable
-class APIObjectWithPods(Protocol):
-    """An APIObject subclass that contains other Pod objects."""
-
-    async def async_ready_pods(self) -> list["Pod"]: ...
 
 
 @runtime_checkable

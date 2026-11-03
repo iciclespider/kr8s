@@ -6,17 +6,18 @@ import inspect
 import pathlib
 import platform
 import tempfile
+import threading
 import time
 from contextlib import suppress
 from unittest import mock
 
 import anyio
-import httpx
+import httpx2
 import pytest
 import yaml
 
 import kr8s
-from kr8s._api import Api
+from kr8s._api import AsyncApi as Api
 from kr8s._async_utils import anext
 from kr8s._exceptions import NotFoundError
 from kr8s._exec import CompletedExec, ExecError
@@ -51,7 +52,7 @@ from kr8s.objects import (
 )
 from kr8s.objects import objects_from_files as sync_objects_from_files
 
-DEFAULT_TIMEOUT = httpx.Timeout(30)
+DEFAULT_TIMEOUT = httpx2.Timeout(30)
 CURRENT_DIR = pathlib.Path(__file__).parent
 
 
@@ -653,13 +654,14 @@ async def test_object_from_spec(example_pod_spec, example_service_spec):
 
 async def test_object_from_spec_sync(example_pod_spec, example_service_spec):
     pod = sync_object_from_spec(example_pod_spec)
-    assert isinstance(pod, Pod)
+    assert isinstance(pod, SyncPod)
+    assert not isinstance(pod, Pod)
     assert pod.name == example_pod_spec["metadata"]["name"]
     assert pod.spec == example_pod_spec["spec"]
     assert not pod._asyncio
 
     service = sync_object_from_spec(example_service_spec)
-    assert isinstance(service, Service)
+    assert isinstance(service, SyncService)
     assert service.name == example_service_spec["metadata"]["name"]
     assert service.spec == example_service_spec["spec"]
     assert not service._asyncio
@@ -798,7 +800,7 @@ async def test_service_proxy():
     assert isinstance(service, Service)
     assert service.name == "kubernetes"
     data = await service.proxy_http_get("/version", raise_for_status=False)
-    assert isinstance(data, httpx.Response)
+    assert isinstance(data, httpx2.Response)
 
 
 async def test_pod_logs(example_pod_spec):
@@ -811,10 +813,21 @@ async def test_pod_logs(example_pod_spec):
     await pod.delete()
 
 
+def test_pod_logs_sync(example_pod_spec):
+    pod = SyncPod(example_pod_spec)
+    pod.create()
+    try:
+        pod.wait("condition=Ready")
+        log = "\n".join(pod.logs(container="pause"))
+        assert isinstance(log, str)
+    finally:
+        pod.delete()
+
+
 async def test_pod_port_forward_context_manager(nginx_service):
     [nginx_pod, *_] = await nginx_service.ready_pods()
     async with nginx_pod.portforward(80, local_port=None) as port:
-        async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as session:
+        async with httpx2.AsyncClient(timeout=DEFAULT_TIMEOUT) as session:
             resp = await session.get(f"http://localhost:{port}/")
             assert resp.status_code == 200
             resp = await session.get(f"http://localhost:{port}/foo")
@@ -829,7 +842,7 @@ def test_pod_port_forward_context_manager_sync(nginx_service):
         nginx_service.name, namespace=nginx_service.namespace
     )
     with nginx_service.portforward(80, local_port=None) as port:
-        with httpx.Client(timeout=DEFAULT_TIMEOUT) as session:
+        with httpx2.Client(timeout=DEFAULT_TIMEOUT) as session:
             resp = session.get(f"http://localhost:{port}/")
             assert resp.status_code == 200
             resp = session.get(f"http://localhost:{port}/foo")
@@ -857,7 +870,7 @@ async def test_pod_port_forward_start_stop(nginx_service):
         assert pf._bg_task is None
         port = await pf.start()
         assert pf._bg_task is not None
-        async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as session:
+        async with httpx2.AsyncClient(timeout=DEFAULT_TIMEOUT) as session:
             resp = await session.get(f"http://localhost:{port}/")
             assert resp.status_code == 200
             resp = await session.get(f"http://localhost:{port}/foo")
@@ -869,9 +882,42 @@ async def test_pod_port_forward_start_stop(nginx_service):
         assert pf._bg_task is None
 
 
+def test_pod_port_forward_start_stop_sync(nginx_service):
+    service = SyncService.get(nginx_service.name, namespace=nginx_service.namespace)
+    [nginx_pod, *_] = service.ready_pods()
+    for _ in range(3):
+        pf = nginx_pod.portforward(80, local_port=None)
+        port = pf.start()
+        assert port == pf.local_port
+        with httpx2.Client(timeout=DEFAULT_TIMEOUT) as session:
+            assert session.get(f"http://localhost:{port}/").status_code == 200
+            assert session.get(f"http://localhost:{port}/foo").status_code == 404
+            resp = session.get(f"http://localhost:{port}/foo.dat")
+            assert resp.status_code == 200
+            resp.read()
+        pf.stop()
+        assert not pf.servers
+        with pytest.raises(httpx2.ConnectError):
+            httpx2.get(f"http://localhost:{port}/", timeout=DEFAULT_TIMEOUT)
+
+
+def test_service_port_forward_run_forever_sync(nginx_service):
+    service = SyncService.get(nginx_service.name, namespace=nginx_service.namespace)
+    pf = service.portforward(80, local_port=None)
+    thread = threading.Thread(target=pf.run_forever, daemon=True)
+    thread.start()
+    while not pf.servers:
+        time.sleep(0.1)
+    with httpx2.Client(timeout=DEFAULT_TIMEOUT) as session:
+        assert session.get(f"http://localhost:{pf.local_port}/").status_code == 200
+    pf.stop()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+
+
 async def test_service_port_forward_context_manager(nginx_service):
     async with nginx_service.portforward(80, local_port=None) as port:
-        async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as session:
+        async with httpx2.AsyncClient(timeout=DEFAULT_TIMEOUT) as session:
             resp = await session.get(f"http://localhost:{port}/")
             assert resp.status_code == 200
             resp = await session.get(f"http://localhost:{port}/foo")
@@ -884,7 +930,7 @@ async def test_service_port_forward_start_stop(nginx_service):
     port = await pf.start()
     assert pf._bg_task is not None
 
-    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as session:
+    async with httpx2.AsyncClient(timeout=DEFAULT_TIMEOUT) as session:
         resp = await session.get(f"http://localhost:{port}/")
         assert resp.status_code == 200
         resp = await session.get(f"http://localhost:{port}/foo")
@@ -916,7 +962,7 @@ async def test_multiple_bind_addresses_port_forward(nginx_service):
 
     # Start the port forwarding
     await pf.start()
-    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as session:
+    async with httpx2.AsyncClient(timeout=DEFAULT_TIMEOUT) as session:
         for address in multiple_addresses:
             resp = await session.get(f"http://{address}:{pf.local_port}/")
             assert resp.status_code == 200
@@ -969,8 +1015,8 @@ def test_objects_from_file_sync():
         )
     )
     assert len(objects) == 2
-    assert isinstance(objects[0], Pod)
-    assert isinstance(objects[1], Service)
+    assert isinstance(objects[0], SyncPod)
+    assert isinstance(objects[1], SyncService)
     assert not objects[0]._asyncio
     assert objects[0].api
     assert not objects[0].api._asyncio
@@ -1171,6 +1217,33 @@ async def test_service_exec(nginx_service):
     assert str(datetime.datetime.now().year) in ex.stdout.decode()
     assert ex.args == ["date"]
     assert ex.stderr == b""
+    assert ex.returncode == 0
+
+
+def test_pod_exec_sync(ubuntu_pod):
+    pod = SyncPod.get(ubuntu_pod.name, namespace=ubuntu_pod.namespace)
+    ex = pod.exec(["date"], timeout=2)
+    assert isinstance(ex, CompletedExec)
+    assert str(datetime.datetime.now().year) in ex.stdout.decode()
+    assert ex.returncode == 0
+
+    with pytest.raises(ExecError):
+        pod.exec(["date", "foo"])
+    ex = pod.exec(["date", "foo"], check=False)
+    assert b"invalid date" in ex.stderr
+    assert ex.returncode == 1
+
+    with tempfile.TemporaryFile(mode="w+b") as tmp:
+        ex = pod.exec(["date"], stdout=tmp, capture_output=False)
+        tmp.seek(0)
+        assert str(datetime.datetime.now().year) in tmp.read().decode()
+        assert ex.stdout == b""
+
+
+def test_service_exec_sync(nginx_service):
+    service = SyncService.get(nginx_service.name, namespace=nginx_service.namespace)
+    ex = service.exec(["date"])
+    assert str(datetime.datetime.now().year) in ex.stdout.decode()
     assert ex.returncode == 0
 
 

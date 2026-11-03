@@ -9,23 +9,24 @@ default and an async API (`asyncio`/`trio`) under `kr8s.asyncio`.
 ## Repository layout
 
 - `kr8s/` — the library source.
-  - `_objects.py` — the heart of the project. Defines `APIObject` (async) and
-    every Kubernetes resource class (`Pod`, `Deployment`, `Service`, …). All
-    real logic lives here as async methods named with an `async_` prefix
-    (e.g. `async_get`, `async_create`, `async_delete`).
-  - `_api.py` — the async `Api` client (auth, request dispatch, caching).
-  - `_auth.py`, `_config.py` — kubeconfig loading, auth, and cluster config.
-  - `_async_utils.py` — the machinery that lets the sync API wrap async code by
-    running a background thread with its own event loop (`Portal`,
-    `as_sync_func`, `as_sync_generator`). Rarely needs changing.
-  - `objects.py`, `_api.py`-derived sync surfaces — the **sync** public API.
-    `APIObjectSyncMixin` (in `_objects.py`) and `kr8s/objects.py` wrap the
-    `async_*` methods with `as_sync_func` / `as_sync_generator`.
-  - `asyncio/` — the **async** public API. Thin re-exports of the underlying
-    async classes/functions from `kr8s._*` modules.
-  - `_exec.py`, `_portforward.py`, `_data_utils.py`, `_exceptions.py` — helpers.
-  - `_vendored/` — third-party code (e.g. `asyncache`). **Do not lint, format,
-    or edit** — it is excluded from all tooling.
+  - `_objects.py` — `BaseAPIObject` and a `Base<Kind>` class for every
+    Kubernetes resource (`BasePod`, `BaseDeployment`, …) holding attributes and
+    all I/O-free logic, plus `get_class`, `new_class` and `parse_kind`.
+  - `objects.py` — the **sync** public objects: `APIObject` and every resource
+    class, doing blocking I/O.
+  - `asyncio/objects.py` — the **async** public objects, doing async I/O.
+  - `_api.py` — `BaseApi`, the sync `Api` (`httpx2.Client`) and `AsyncApi`
+    (`httpx2.AsyncClient`): auth, request dispatch, caching.
+  - `_auth.py`, `_config.py` — kubeconfig loading, auth, and cluster config, as
+    `BaseKubeAuth` / `KubeAuth` / `AsyncKubeAuth` and `BaseKubeConfig` /
+    `KubeConfig` / `AsyncKubeConfig` (plus the `*KubeConfigSet` variants).
+  - `_exec.py`, `_portforward.py` — `BaseExec` / `Exec` / `AsyncExec` and
+    `BasePortForward`. The port forwards themselves are in `portforward.py`
+    (sync, threads) and `asyncio/portforward.py` (asyncio).
+  - `__init__.py` and `asyncio/` — the top-level sync and async helpers
+    (`kr8s.get`, `kr8s.asyncio.get`, …).
+  - `_async_utils.py` — small helpers for the async implementations.
+  - `_data_utils.py`, `_exceptions.py` — helpers.
   - `tests/` — pytest suite (`test_*.py`), plus `resources/` and `scripts/`.
   - `conftest.py` (both root and `kr8s/`) — shared fixtures.
 - `docs/` — Sphinx documentation (MyST markdown). `contributing.md` and
@@ -37,22 +38,32 @@ default and an async API (`asyncio`/`trio`) under `kr8s.asyncio`.
 
 ## The sync/async architecture (read this before editing resource code)
 
-kr8s is built async-first. **All real implementation is async and lives once.**
+kr8s follows the same pattern as httpx (`BaseClient` → `Client` /
+`AsyncClient`). Every type that does I/O has three classes:
 
-1. Write logic as an `async def async_<name>(...)` method on the async class in
-   `kr8s/_objects.py` (or `_api.py`).
-2. Expose it on the async API via `kr8s/asyncio/` re-exports (no wrapping — the
-   async method is the public async method minus the `async_` prefix where the
-   public name is defined, or exposed directly).
-3. Expose it on the sync API by adding a wrapper in the `*SyncMixin` /
-   `kr8s/objects.py` that calls `as_sync_func(self.async_<name>)(...)` (or
-   `as_sync_generator` for generators).
+- `BaseX` holds state, properties and every decision that doesn't need I/O:
+  building URLs, params and payloads, parsing responses, checking conditions.
+  It never awaits or blocks.
+- `X` (sync) and `AsyncX` (async) subclass the base and only do the I/O. Each
+  method should read as "build with a base helper → do the request → parse with
+  a base helper".
 
-When you add or change a method, update **both** the async source and its sync
-wrapper, and keep signatures in sync. Sync wrappers carry
-`# type: ignore[override]` because they intentionally override async signatures
-with sync ones — this is expected. Docstrings live on the async version; sync
-wrappers inherit them (`kr8s/objects.py` sets `# ruff: noqa: D102`).
+The sync side does real blocking I/O (`httpx2.Client`, sync websockets,
+threads). It never runs async code, so there's no background event loop.
+
+When you add or change behaviour:
+
+1. Put any logic that doesn't need I/O on the `Base*` class, usually as a
+   private helper.
+2. Implement the I/O in **both** the sync class (`kr8s/objects.py`, `_api.py`'s
+   `Api`, …) and the async class (`kr8s/asyncio/objects.py`, `AsyncApi`, …),
+   keeping their signatures the same apart from `async`.
+3. Use the same method names on both sides. Don't add `async_`-prefixed
+   twins of public methods.
+
+Resource classes combine their base with the flavour's `APIObject`, base first:
+`class Pod(BasePod, APIObject)`. `get_class` and `new_class` choose sync or
+async classes using the `_asyncio` class attribute.
 
 ## Development environment
 
@@ -105,7 +116,7 @@ Key testing facts:
   `patch.object`) for test doubles and temporary replacements. Avoid pytest's
   `monkeypatch` when `unittest.mock` can express the same behavior.
 - Set `KUBERNETES_VERSION` to test against a specific k8s version. CI runs a
-  matrix of Python 3.9–3.14 and multiple Kubernetes versions.
+  matrix of Python 3.12–3.15 and multiple Kubernetes versions.
 - Test/`conftest.py`/`examples`/`docs`/`ci` code is exempt from docstring (`D`),
   naming (`N`), and bugbear (`B`) lint rules.
 
@@ -127,16 +138,14 @@ The hooks (see `.pre-commit-config.yaml`) are:
   Google-style docstrings.
 - **insert-license** — every `.py` file must carry the SPDX header from
   `LICENSE_HEADER` (auto-inserted). Keep it at the top of new files.
-- **mypy** — type checking (excludes `examples`, `ci`, `docs`, `_vendored`).
+- **mypy** — type checking (excludes `examples`, `ci`, `docs`).
   The library is typed and ships `py.typed`; keep annotations correct.
-- **pyupgrade** — enforces modern syntax (`--py39-plus`); the project targets
-  Python **3.9+**, so don't use syntax newer than 3.9 in library code.
-
-`_vendored/` is excluded from every hook — never reformat it.
+- **pyupgrade** — enforces modern syntax (`--py312-plus`); the project targets
+  Python **3.12.1+**, so don't use syntax newer than 3.12 in library code.
 
 ## Conventions
 
-- **Python 3.9+ compatibility** in `kr8s/` library code. Use
+- **Python 3.12.1+ compatibility** in `kr8s/` library code. Use
   `from __future__ import annotations` for modern typing syntax.
 - Keep code **human-readable** — a project goal is no swagger/generated code.
 - Public API changes should be reflected in `docs/` (MyST markdown). Where docs
@@ -185,9 +194,10 @@ separate `test-kubectl-ng.yaml` workflow, not the main test workflow.
 
 ## Quick checklist before finishing a change
 
-1. Implemented logic once as an `async_*` method (async-first).
-2. Added/updated the matching **sync wrapper** with `as_sync_func` /
-   `as_sync_generator`, and exported new kinds from both `objects.py` modules.
+1. Put I/O-free logic on the `Base*` class.
+2. Implemented the I/O in **both** the sync and async classes, and added new
+   kinds as `Base<Kind>` in `_objects.py` plus a class in each `objects.py`
+   module (exported from `kr8s/asyncio/objects.py` `__all__`).
 3. Added/updated tests in `kr8s/tests/` (they will spin up kind).
 4. `uv run task test` (or the relevant subset) passes.
 5. `pre-commit run --all-files` is clean (black, ruff, mypy, license header).

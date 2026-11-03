@@ -13,8 +13,9 @@ import yaml
 
 import kr8s
 from kr8s._async_utils import anext
-from kr8s._auth import KubeAuth
-from kr8s._config import KubeConfig
+from kr8s._auth import AsyncKubeAuth as KubeAuth
+from kr8s._auth import KubeAuth as SyncKubeAuth
+from kr8s._config import AsyncKubeConfig as KubeConfig
 from kr8s._testutils import set_env, unset_env
 
 HERE = Path(__file__).parent.resolve()
@@ -350,6 +351,25 @@ async def test_service_account_dns_fallback_no_env_vars(serviceaccount, k8s_toke
 
     assert auth.server == "https://kubernetes.default.svc:443"
     assert auth.token == k8s_token
+
+
+def test_service_account_sync(serviceaccount, k8s_token):
+    with unset_env("KUBERNETES_SERVICE_HOST", "KUBERNETES_SERVICE_PORT"):
+        auth = SyncKubeAuth(serviceaccount=serviceaccount, kubeconfig="/no/file/here")
+        auth.reauthenticate()
+
+    assert auth.server == "https://kubernetes.default.svc:443"
+    assert auth.token == k8s_token
+    assert auth.namespace == (Path(serviceaccount) / "namespace").read_text()
+
+
+def test_kubeconfig_sync(k8s_cluster):
+    auth = SyncKubeAuth(kubeconfig=k8s_cluster.kubeconfig_path)
+    auth.reauthenticate()
+    assert auth.server
+    assert auth.active_context
+    assert auth.client_cert_file or auth.token
+    assert isinstance(auth.ssl_context(), ssl.SSLContext)
 
 
 async def test_service_account_dns_fallback_only_host_set(serviceaccount):

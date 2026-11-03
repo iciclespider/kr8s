@@ -1,22 +1,18 @@
 # SPDX-FileCopyrightText: Copyright (c) 2023-2026, Kr8s Developers (See LICENSE for list)
 # SPDX-License-Identifier: BSD 3-Clause License
-import asyncio
-import threading
-from typing import Optional
+from typing import cast
 
-from kr8s._api import Api as _AsyncApi
-from kr8s._api import hash_kwargs
+from kr8s._api import AsyncApi
 from kr8s._types import PathType
 
 
 async def api(
-    url: Optional[str] = None,
-    kubeconfig: Optional[PathType] = None,
-    serviceaccount: Optional[str] = None,
-    namespace: Optional[str] = None,
-    context: Optional[str] = None,
-    _asyncio: bool = True,
-) -> _AsyncApi:
+    url: str | None = None,
+    kubeconfig: PathType | None = None,
+    serviceaccount: str | None = None,
+    namespace: str | None = None,
+    context: str | None = None,
+) -> AsyncApi:
     """Create a `kr8s.asyncio.Api` object for interacting with the Kubernetes API.
 
     If a kr8s object already exists with the same arguments in this thread, it will be returned.
@@ -36,39 +32,14 @@ async def api(
         >>> api = await kr8s.asyncio.api()  # Uses the default kubeconfig
         >>> print(await api.version())  # Get the Kubernetes version
     """
-    from kr8s import Api as _SyncApi
-
-    if _asyncio:
-        _cls = _AsyncApi
-    else:
-        _cls = _SyncApi
-
-    async def _f(**kwargs):
-        key = hash_kwargs(kwargs)
-        thread_id = threading.get_ident()
-        try:
-            loop_id = id(asyncio.get_running_loop())
-        except RuntimeError:
-            loop_id = 0
-        thread_loop_id = f"{thread_id}.{loop_id}"
-        if (
-            _cls._instances
-            and thread_loop_id in _cls._instances
-            and key in _cls._instances[thread_loop_id]
-        ):
-            return await _cls._instances[thread_loop_id][key]
-        if (
-            all(k is None for k in kwargs.values())
-            and thread_loop_id in _cls._instances
-            and list(_cls._instances[thread_loop_id].values())
-        ):
-            return await list(_cls._instances[thread_loop_id].values())[0]
-        return await _cls(**kwargs, bypass_factory=True)
-
-    return await _f(
+    kwargs = dict(
         url=url,
         kubeconfig=kubeconfig,
         serviceaccount=serviceaccount,
         namespace=namespace,
         context=context,
     )
+    instance = cast(AsyncApi | None, AsyncApi._cached_instance(**kwargs))
+    if instance is None:
+        instance = AsyncApi(**kwargs, bypass_factory=True)
+    return await instance

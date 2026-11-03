@@ -1,36 +1,28 @@
 # SPDX-FileCopyrightText: Copyright (c) 2023-2026, Kr8s Developers (See LICENSE for list)
 # SPDX-License-Identifier: BSD 3-Clause License
+"""Base classes for Kubernetes objects.
+
+Each Kubernetes kind has a ``Base<Kind>`` class here which holds its attributes and every piece
+of logic that doesn't need I/O. The sync classes in :mod:`kr8s.objects` and the async classes in
+:mod:`kr8s.asyncio.objects` combine these with their own ``APIObject``, which implements the API calls.
+"""
+
 from __future__ import annotations
 
 import contextlib
 import json
 import pathlib
 import re
-import sys
-import time
-from collections.abc import AsyncGenerator, Generator
 from typing import (
+    TYPE_CHECKING,
     Any,
-    BinaryIO,
     Literal,
-    cast,
 )
 
-import anyio
-import httpx
 import jsonpath
 import yaml
 from box import Box
 
-if sys.version_info >= (3, 11):
-    from typing import Self
-else:
-    from typing_extensions import Self
-
-import kr8s
-import kr8s.asyncio
-from kr8s._api import Api
-from kr8s._async_utils import as_sync_func, as_sync_generator
 from kr8s._data_utils import (
     dict_to_selector,
     dot_to_nested_dict,
@@ -39,16 +31,15 @@ from kr8s._data_utils import (
     xdict,
 )
 from kr8s._exceptions import NotFoundError, ServerError
-from kr8s._exec import CompletedExec, Exec
 from kr8s._types import SpecType, SupportsKeysAndGetItem
-from kr8s.asyncio.portforward import PortForward as AsyncPortForward
-from kr8s.portforward import LocalPortType
-from kr8s.portforward import PortForward as SyncPortForward
+
+if TYPE_CHECKING:
+    from kr8s._api import BaseApi
 
 JSONPATH_CONDITION_EXPRESSION = r"jsonpath='{(?P<expression>.*?)}'=(?P<condition>.*)"
 
 
-class APIObject:
+class BaseAPIObject:
     """Base class for Kubernetes objects."""
 
     version: str
@@ -59,10 +50,14 @@ class APIObject:
     namespaced: bool = False
     scalable: bool = False
     scalable_spec: str = "replicas"
-    _asyncio: bool = True
+    # True for async objects, False for sync objects and None for the shared base classes
+    _asyncio: bool | None = None
 
     def __init__(
-        self, resource: SpecType, namespace: str | None = None, api: Api | None = None
+        self,
+        resource: SpecType,
+        namespace: str | None = None,
+        api: BaseApi | None = None,
     ) -> None:
         """Initialize an APIObject."""
         if isinstance(resource, dict):
@@ -82,16 +77,6 @@ class APIObject:
         if namespace is not None:
             self.raw["metadata"]["namespace"] = namespace  # type: ignore
         self._api = api
-        if self._api is None and not self._asyncio:
-            self._api = kr8s.api()
-
-    def __await__(self):
-        async def f():
-            if self._api is None:
-                self._api = await kr8s.asyncio.api()
-            return self
-
-        return f().__await__()
 
     def __repr__(self):
         """Return a string representation of the Kubernetes resource."""
@@ -248,162 +233,22 @@ class APIObject:
         else:
             raise NotImplementedError(f"{self.kind} is not scalable")
 
-    @classmethod
-    async def get(
-        cls,
-        name: str | None = None,
-        namespace: str | None = None,
-        api: Api | None = None,
-        label_selector: str | dict[str, str] | None = None,
-        field_selector: str | dict[str, str] | None = None,
-        timeout: int = 2,
-        **kwargs,
-    ) -> Self:
-        """Get a Kubernetes resource by name or via selectors."""
-        return await cls.async_get(
-            name=name,
-            namespace=namespace,
-            api=api,
-            label_selector=label_selector,
-            field_selector=field_selector,
-            timeout=timeout,
-            **kwargs,
-        )
+    @property
+    def _url(self) -> str:
+        return f"{self.endpoint}/{self.name}"
 
-    @classmethod
-    async def async_get(
-        cls,
-        name: str | None = None,
-        namespace: str | None = None,
-        api: Api | None = None,
-        label_selector: str | dict[str, str] | None = None,
-        field_selector: str | dict[str, str] | None = None,
-        timeout: int = 2,
-        **kwargs,
-    ) -> Self:
-        """Get a Kubernetes resource by name or via selectors."""
-        if api is None:
-            if cls._asyncio:
-                api = await kr8s.asyncio.api()
-            else:
-                api = await kr8s.asyncio.api(_asyncio=False)
-        namespace = namespace if namespace else api.namespace
-        start = time.time()
-        backoff = 0.1
-        while start + timeout > time.time():
-            if name:
-                try:
-                    resources = [
-                        resource
-                        async for resource in api.async_get(
-                            cls,
-                            name,
-                            namespace=namespace,
-                            field_selector={"metadata.name": name},
-                            **kwargs,
-                        )
-                    ]
-                except ServerError as e:
-                    if e.response and e.response.status_code == 404:
-                        continue
-                    raise e
-            elif label_selector or field_selector:
-                resources = [
-                    resource
-                    async for resource in api.async_get(
-                        cls,
-                        namespace=namespace,
-                        label_selector=label_selector,
-                        field_selector=field_selector,
-                        **kwargs,
-                    )
-                ]
-            else:
-                raise ValueError("Must specify name or selector")
-            if not isinstance(resources, list):
-                resources = [resources]
-            if len(resources) == 0:
-                await anyio.sleep(backoff)
-                backoff = min(backoff * 2, 1)
-                continue
-            if len(resources) > 1:
-                raise ValueError(
-                    f"Expected exactly one {cls.kind} object. Use selectors to narrow down the search."
-                )
-            assert isinstance(resources[0], cls)
-            return resources[0]
-        raise NotFoundError(
-            f"Could not find {cls.kind} {name} in namespace {namespace}."
-        )
-
-    async def exists(self, ensure=False) -> bool:
-        """Check if this object exists in Kubernetes."""
-        return await self.async_exists(ensure=ensure)
-
-    async def async_exists(self, ensure=False) -> bool:
-        """Check if this object exists in Kubernetes."""
-        try:
-            assert self.api
-            async with self.api.call_api(
-                "GET",
-                version=self.version,
-                url=f"{self.endpoint}/{self.name}",
-                namespace=self.namespace,
-                raise_for_status=False,
-            ) as resp:
-                status = resp.status_code
-        except ValueError:
-            status = 400
-        if status == 200:
-            return True
-        if ensure:
-            raise NotFoundError(
+    def _not_found(self, e: ServerError) -> NotFoundError | None:
+        """Convert a 404 from the API into a NotFoundError."""
+        if e.response and e.response.status_code == 404:
+            return NotFoundError(
                 f"Object {self.name} does not exist in {self.namespace}"
             )
-        return False
+        return None
 
-    async def async_create(self) -> None:
-        """Create this object in Kubernetes."""
-        assert self.api
-        async with self.api.call_api(
-            "POST",
-            version=self.version,
-            url=self.endpoint,
-            namespace=self.namespace,
-            content=json.dumps(self.raw_template),
-        ) as resp:
-            self.raw = resp.json()
-
-    async def create(self) -> None:
-        """Create this object in Kubernetes."""
-        return await self.async_create()
-
-    async def delete(
-        self,
-        propagation_policy: str | None = None,
-        grace_period: int | None = None,
-        force: bool = False,
-    ) -> None:
-        """Delete this object from Kubernetes.
-
-        Args:
-            propagation_policy: The deletion propagation policy.
-            grace_period: The grace period for deletion.
-            force: Force deletion. (Setting to ``True`` is equivelaent to setting grace_period to 0)
-        """
-        return await self.async_delete(
-            propagation_policy=propagation_policy,
-            grace_period=grace_period,
-            force=force,
-        )
-
-    async def async_delete(
-        self,
-        propagation_policy: str | None = None,
-        grace_period: int | None = None,
-        force: bool = False,
-    ) -> None:
-        """Delete this object from Kubernetes."""
+    @staticmethod
+    def _delete_payload(
+        propagation_policy: str | None, grace_period: int | None, force: bool
+    ) -> str:
         data: dict[str, Any] = {}
         if propagation_policy:
             data["propagationPolicy"] = propagation_policy
@@ -413,174 +258,95 @@ class APIObject:
             data["gracePeriodSeconds"] = grace_period
         elif force:
             data["gracePeriodSeconds"] = 0
-        try:
-            assert self.api
-            async with self.api.call_api(
-                "DELETE",
-                version=self.version,
-                url=f"{self.endpoint}/{self.name}",
-                namespace=self.namespace,
-                content=json.dumps(data),
-            ):
-                pass
-        except ServerError as e:
-            if e.response and e.response.status_code == 404:
-                raise NotFoundError(
-                    f"Object {self.name} does not exist in {self.namespace}"
-                ) from e
-            raise e
+        return json.dumps(data)
 
-    async def refresh(self) -> None:
-        """Refresh this object from Kubernetes."""
-        await self.async_refresh()
-
-    async def async_refresh(self) -> None:
-        """Refresh this object from Kubernetes."""
-        try:
-            assert self.api
-            async with self.api.call_api(
-                "GET",
-                version=self.version,
-                url=f"{self.endpoint}/{self.name}",
-                namespace=self.namespace,
-            ) as resp:
-                self.raw = resp.json()
-        except ServerError as e:
-            if e.response and e.response.status_code == 404:
-                raise NotFoundError(
-                    f"Object {self.name} does not exist in {self.namespace}"
-                ) from e
-            raise e
-
-    async def patch(self, patch, *, subresource=None, type=None) -> None:
-        """Patch this object in Kubernetes."""
-        await self.async_patch(patch, subresource=subresource, type=type)
-
-    async def async_patch(
-        self, patch: dict | list, *, subresource=None, type=None
-    ) -> None:
-        """Patch this object in Kubernetes."""
-        url = f"{self.endpoint}/{self.name}"
+    def _patch_request(
+        self, subresource: str | None, type: str | None
+    ) -> tuple[str, dict[str, str]]:
+        """Return the URL and headers for a patch."""
+        url = self._url
         if type == "json":
             headers = {"Content-Type": "application/json-patch+json"}
         else:
             headers = {"Content-Type": "application/merge-patch+json"}
         if subresource:
             url = f"{url}/{subresource}"
-        try:
-            assert self.api
-            async with self.api.call_api(
-                "PATCH",
-                version=self.version,
-                url=url,
-                namespace=self.namespace,
-                content=json.dumps(patch),
-                headers=headers,
-            ) as resp:
-                self.raw = resp.json()
-        except ServerError as e:
-            if e.response and e.response.status_code == 404:
-                raise NotFoundError(
-                    f"Object {self.name} does not exist in {self.namespace}"
-                ) from e
-            raise e
+        return url, headers
 
-    async def scale(self, replicas: int | None = None) -> None:
-        """Scale this object in Kubernetes."""
-        return await self.async_scale(replicas=replicas)
-
-    async def async_scale(self, replicas: int | None = None) -> None:
-        """Scale this object in Kubernetes."""
+    def _scale_patch(self, replicas: int | None) -> dict:
         if not self.scalable:
             raise NotImplementedError(f"{self.kind} is not scalable")
-        await self.async_exists(ensure=True)
-        await self.async_patch(
-            {"spec": dot_to_nested_dict(self.scalable_spec, replicas)}
-        )
-        while self.replicas != replicas:
-            await self.async_refresh()
-            await anyio.sleep(0.1)
+        return {"spec": dot_to_nested_dict(self.scalable_spec, replicas)}
 
-    async def exec(
+    @staticmethod
+    def _annotations_patch(annotations: dict | None, kwargs: dict) -> dict:
+        if annotations is None:
+            annotations = kwargs
+        if not annotations:
+            raise ValueError("No annotations provided")
+        return {"metadata": {"annotations": annotations}}
+
+    @staticmethod
+    def _labels_to_remove(labels: tuple[dict | str, ...]) -> list[str] | None:
+        """Return the label names to remove if ``labels`` are all ``name-`` strings."""
+        if labels and all([isinstance(label, str) for label in labels]):
+            labels_to_remove = []
+            for label in labels:
+                assert isinstance(label, str)
+                assert label.endswith("-"), "Label must end with - to remove"
+                labels_to_remove.append(label[:-1])
+            return labels_to_remove
+        return None
+
+    @staticmethod
+    def _labels_patch(labels: tuple[dict | str, ...], kwargs: dict) -> dict:
+        labels_dict = None
+        if not labels:
+            labels_dict = kwargs
+        if labels and isinstance(labels[0], dict):
+            labels_dict = labels[0]
+        if not labels_dict:
+            raise ValueError("No labels provided")
+        return {"metadata": {"labels": labels_dict}}
+
+    @staticmethod
+    def _remove_labels_patch(labels: tuple[str, ...]) -> list[dict]:
+        if not labels:
+            raise ValueError("No labels provided")
+        return [
+            {"op": "remove", "path": "/metadata/labels/" + escape_rfc6901(label)}
+            for label in labels
+        ]
+
+    @staticmethod
+    def _owner_patch(owner: BaseAPIObject) -> dict:
+        return {
+            "metadata": {
+                "ownerReferences": [
+                    {
+                        "controller": True,
+                        "blockOwnerDeletion": True,
+                        "apiVersion": owner.version,
+                        "kind": owner.kind,
+                        "name": owner.name,
+                        "uid": owner.metadata.uid,
+                    }
+                ],
+            }
+        }
+
+    def _test_conditions(
         self,
-        command: list[str],
-        *,
-        container: str | None = None,
-        stdin: str | BinaryIO | None = None,
-        stdout: BinaryIO | None = None,
-        stderr: BinaryIO | None = None,
-        check: bool = True,
-        capture_output: bool = True,
-        timeout: int | None = None,
-    ) -> CompletedExec:
-        """Execute a command in this object."""
-        return await self.async_exec(
-            command,
-            container=container,
-            stdin=stdin,
-            stdout=stdout,
-            stderr=stderr,
-            check=check,
-            capture_output=capture_output,
-            timeout=timeout,
-        )
-
-    async def async_exec(
-        self,
-        command: list[str],
-        *,
-        container: str | None = None,
-        stdin: str | BinaryIO | None = None,
-        stdout: BinaryIO | None = None,
-        stderr: BinaryIO | None = None,
-        check: bool = True,
-        capture_output: bool = True,
-        timeout: int | None = None,
-    ) -> CompletedExec:
-        """Execute a command in this object."""
-        if not hasattr(self, "ready_pods"):
-            raise NotImplementedError(f"{self.kind} does not support exec")
-        pods: list[Pod] = await self.ready_pods()
-        if not pods:
-            raise RuntimeError("No ready pods found")
-        pod = pods[0]
-        return await pod.async_exec(
-            command,
-            container=container,
-            stdin=stdin,
-            stdout=stdout,
-            stderr=stderr,
-            check=check,
-            capture_output=capture_output,
-            timeout=timeout,
-        )
-
-    async def async_watch(self) -> AsyncGenerator[tuple[str, Self]]:
-        """Watch this object in Kubernetes."""
-        since = self.metadata.get("resourceVersion")
-        assert self.api
-        async for event, obj in self.api.async_watch(
-            self.endpoint,
-            namespace=self.namespace,
-            field_selector=f"metadata.name={self.name}",
-            since=since,
-        ):
-            self.raw = obj.raw
-            yield event, self
-
-    async def watch(self) -> AsyncGenerator[tuple[str, Self]]:
-        """Watch this object in Kubernetes."""
-        async for event, obj in self.async_watch():
-            yield event, obj
-
-    async def _test_conditions(
-        self, conditions: list, mode: Literal["any", "all"] = "any"
+        conditions: list,
+        mode: Literal["any", "all"] = "any",
+        exists: bool | None = None,
     ) -> bool:
         """Test if conditions are met.
 
         Args:
             conditions: A list of conditions to test.
             mode: Match any condition with "any" or all conditions with "all". Defaults to "any".
+            exists: Whether the object still exists, required to test the "delete" condition.
 
         Returns:
             bool: True if any condition is met, False otherwise.
@@ -602,7 +368,7 @@ class APIObject:
                 )
                 results.append(status_conditions.get(field, None) == value)
             elif condition == "delete":
-                results.append(not await self.async_exists())
+                results.append(not exists)
             elif condition.startswith("jsonpath"):
                 matches = re.search(JSONPATH_CONDITION_EXPRESSION, condition)
                 if not matches:
@@ -622,149 +388,6 @@ class APIObject:
         else:
             raise ValueError(f"Unknown wait mode '{mode}', must be 'any' or 'all'")
 
-    async def wait(
-        self,
-        conditions: list[str] | str,
-        mode: Literal["any", "all"] = "any",
-        timeout: int | None = None,
-    ):
-        """Wait for conditions to be met.
-
-        Args:
-            conditions: A list of conditions to wait for.
-            mode: Match any condition with "any" or all conditions with "all". Defaults to "any".
-            timeout: Timeout in seconds.
-
-        Example:
-            Wait for a Pod to be ready.
-
-            >>> from kr8s.objects import Pod
-            >>> pod = Pod.get("my-pod")
-            >>> pod.wait("condition=Ready")
-
-            Wait for a Job to either succeed or fail.
-
-            >>> from kr8s.objects import Job
-            >>> job = Job.get("my-jod")
-            >>> job.wait(["condition=Complete", "condition=Failed"])
-
-            Wait for a Pod to be initialized and ready to start containers.
-
-            >>> from kr8s.objects import Pod
-            >>> pod = Pod.get("my-pod")
-            >>> pod.wait(["condition=Initialized", "condition=PodReadyToStartContainers"], mode="all")
-
-        Note:
-            As of the current Kubertenetes release when this function was written (1.29) kubectl doesn't support
-            multiple conditions. There is a PR to implement this but it hasn't been merged yet
-            https://github.com/kubernetes/kubernetes/pull/119205.
-
-            Given that ``for`` is a reserved word anyway we can't exactly match the kubectl API so
-            we use ``condition`` in combination with a ``mode`` instead.
-        """
-        return await self.async_wait(conditions, mode=mode, timeout=timeout)
-
-    async def async_wait(
-        self,
-        conditions: list[str] | str,
-        mode: Literal["any", "all"] = "any",
-        timeout: int | float | None = None,
-    ):
-        if isinstance(conditions, str):
-            conditions = [conditions]
-
-        with anyio.fail_after(timeout):
-            try:
-                await self.async_refresh()
-            except NotFoundError:
-                if set(conditions) == {"delete"}:
-                    return
-            if await self._test_conditions(conditions, mode=mode):
-                return
-            async for _ in self.async_watch():
-                if await self._test_conditions(conditions, mode=mode):
-                    return
-
-    async def annotate(self, annotations: dict | None = None, **kwargs) -> None:
-        """Annotate this object in Kubernetes."""
-        return await self.async_annotate(annotations=annotations, **kwargs)
-
-    async def async_annotate(self, annotations: dict | None = None, **kwargs) -> None:
-        """Annotate this object in Kubernetes."""
-        if annotations is None:
-            annotations = kwargs
-        if not annotations:
-            raise ValueError("No annotations provided")
-        await self.async_patch({"metadata": {"annotations": annotations}})
-
-    async def label(self, *labels: dict | str, **kwargs) -> None:
-        """Add labels to this object in Kubernetes.
-
-        Labels can be passed as a dictionary or as keyword arguments.
-
-        Args:
-            labels:
-                A dictionary of labels to set or string to remove.
-            **kwargs:
-                Labels to set.
-
-        Example:
-            >>> from kr8s.objects import Deployment
-            >>> deployment = Deployment.get("my-deployment")
-            >>> # Both of these are equivalent
-            >>> deployment.label({"app": "my-app"})
-            >>> deployment.label(app="my-app")
-
-            >>> # You can also remove a label by passing it's name with a `-` on the end
-            >>> deployment.label("app-")
-        """
-        return await self.async_label(*labels, **kwargs)
-
-    async def async_label(self, *labels: dict | str, **kwargs) -> None:
-        """Add labels to this object in Kubernetes."""
-        if labels and all([isinstance(label, str) for label in labels]):
-            labels_to_remove = []
-            for label in labels:
-                assert isinstance(label, str)
-                assert label.endswith("-"), "Label must end with - to remove"
-                labels_to_remove.append(label[:-1])
-            await self.async_remove_label(*labels_to_remove)
-        else:
-            labels_dict = None
-            if not labels:
-                labels_dict = kwargs
-            if labels and isinstance(labels[0], dict):
-                labels_dict = labels[0]
-            if not labels_dict:
-                raise ValueError("No labels provided")
-            await self.async_patch({"metadata": {"labels": labels_dict}})
-
-    async def remove_label(self, *labels: str) -> None:
-        """Remove labels from this object in Kubernetes.
-
-        Labels can be passed as a list of strings.
-
-        Args:
-            labels: A list of labels to remove.
-
-        Example:
-            >>> from kr8s.objects import Deployment
-            >>> deployment = Deployment.get("my-deployment")
-            >>> deployment.remove_label("app")
-        """
-        return await self.async_remove_label(*labels)
-
-    async def async_remove_label(self, *labels: str) -> None:
-        """Remove labels from this object in Kubernetes."""
-        if not labels:
-            raise ValueError("No labels provided")
-
-        operations = [
-            {"op": "remove", "path": "/metadata/labels/" + escape_rfc6901(label)}
-            for label in labels
-        ]
-        await self.async_patch(operations, type="json")
-
     def keys(self) -> list:
         """Return the keys of this object."""
         return self.raw.keys()
@@ -776,63 +399,6 @@ class APIObject:
     def __setitem__(self, key: str, value: Any) -> None:
         """Set an item in this object."""
         self.raw[key] = value
-
-    async def set_owner(self, owner: APIObject) -> None:
-        """Set the owner reference of this object.
-
-        See https://kubernetes.io/docs/concepts/overview/working-with-objects/owners-dependents/
-
-        Args:
-            owner: The owner object to set a reference to.
-
-        Example:
-            >>> from kr8s.objects import Deployment, Pod
-            >>> deployment = Deployment.get("my-deployment")
-            >>> pod = Pod.get("my-pod")
-            >>> pod.set_owner(deployment)
-        """
-        await self.async_set_owner(owner)
-
-    async def async_set_owner(self, owner: APIObject) -> None:
-        """Set the owner of this object."""
-        await self.async_patch(
-            {
-                "metadata": {
-                    "ownerReferences": [
-                        {
-                            "controller": True,
-                            "blockOwnerDeletion": True,
-                            "apiVersion": owner.version,
-                            "kind": owner.kind,
-                            "name": owner.name,
-                            "uid": owner.metadata.uid,
-                        }
-                    ],
-                }
-            }
-        )
-
-    async def adopt(self, child: APIObject) -> None:
-        """Adopt this object.
-
-        This will set the owner reference of the child object to this object.
-
-        See https://kubernetes.io/docs/concepts/overview/working-with-objects/owners-dependents/
-
-        Args:
-            child: The child object to adopt.
-
-        Example:
-            >>> from kr8s.objects import Deployment, Pod
-            >>> deployment = Deployment.get("my-deployment")
-            >>> pod = Pod.get("my-pod")
-            >>> deployment.adopt(pod)
-
-        """
-        return await self.async_adopt(child)
-
-    async def async_adopt(self, child: APIObject) -> None:
-        await child.async_set_owner(self)
 
     def to_dict(self) -> dict:
         """Return a dictionary representation of this object."""
@@ -907,121 +473,11 @@ class APIObject:
     def gen(cls, *args, **kwargs):
         raise NotImplementedError("gen is not implemented for this object")
 
-    @classmethod
-    async def async_list(
-        cls, api: Api | None = None, **kwargs
-    ) -> AsyncGenerator[Self | dict]:
-        if api is None:
-            if cls._asyncio:
-                api = await kr8s.asyncio.api()
-            else:
-                api = await kr8s.asyncio.api(_asyncio=False)
-        async for resource in api.async_get(kind=cls, **kwargs):
-            if isinstance(resource, dict) or isinstance(resource, cls):
-                yield resource
-
-    # Must be the last method defined due to https://github.com/python/mypy/issues/17517
-    @classmethod
-    async def list(cls, **kwargs) -> AsyncGenerator[Self | dict]:
-        """List objects in Kubernetes.
-
-        Args:
-            api: An optional API object to use.
-            **kwargs: Keyword arguments to pass to :func:`kr8s.get`.
-
-        Returns:
-            A list of objects or dictionaries (if raw=True).
-        """
-        async for resource in cls.async_list(**kwargs):
-            yield resource
-
-
-class APIObjectSyncMixin(APIObject):
-    _asyncio = False
-
-    @classmethod
-    def get(  # type: ignore[override]
-        cls,
-        name: str | None = None,
-        namespace: str | None = None,
-        api: Api | None = None,
-        label_selector: str | dict[str, str] | None = None,
-        field_selector: str | dict[str, str] | None = None,
-        timeout: int = 2,
-        **kwargs,
-    ) -> Self:
-        return as_sync_func(cls.async_get)(
-            name=name,
-            namespace=namespace,
-            api=api,
-            label_selector=label_selector,
-            field_selector=field_selector,
-            timeout=timeout,
-            **kwargs,
-        )
-
-    def exists(self, ensure=False) -> bool:  # type: ignore[override]
-        return as_sync_func(self.async_exists)(ensure=ensure)
-
-    def create(self) -> None:  # type: ignore[override]
-        return as_sync_func(self.async_create)()
-
-    def delete(  # type: ignore[override]
-        self,
-        propagation_policy: str | None = None,
-        grace_period: int | None = None,
-        force: bool = False,
-    ) -> None:
-        as_sync_func(self.async_delete)(
-            propagation_policy=propagation_policy,
-            grace_period=grace_period,
-            force=force,
-        )
-
-    def refresh(self) -> None:  # type: ignore[override]
-        return as_sync_func(self.async_refresh)()
-
-    def patch(self, patch, *, subresource=None, type=None) -> None:  # type: ignore[override]
-        return as_sync_func(self.async_patch)(patch, subresource=subresource, type=type)
-
-    def scale(self, replicas=None) -> None:  # type: ignore[override]
-        return as_sync_func(self.async_scale)(replicas=replicas)
-
-    def watch(self) -> Generator[tuple[str, Self]]:  # type: ignore[override]
-        yield from as_sync_generator(self.async_watch)()
-
-    def wait(  # type: ignore[override]
-        self,
-        conditions: list[str] | str,
-        mode: Literal["any", "all"] = "any",
-        timeout: int | float | None = None,
-    ) -> None:
-        return as_sync_func(self.async_wait)(conditions, mode=mode, timeout=timeout)
-
-    def annotate(self, annotations=None, **kwargs) -> None:  # type: ignore[override]
-        return as_sync_func(self.async_annotate)(annotations, **kwargs)
-
-    def label(self, *labels: dict | str, **kwargs) -> None:  # type: ignore[override]
-        return as_sync_func(self.async_label)(*labels, **kwargs)
-
-    def remove_label(self, *labels: str) -> None:  # type: ignore[override]
-        return as_sync_func(self.async_remove_label)(*labels)
-
-    def set_owner(self, owner) -> None:  # type: ignore[override]
-        return as_sync_func(self.async_set_owner)(owner)
-
-    def adopt(self, child) -> None:  # type: ignore[override]
-        return as_sync_func(self.async_adopt)(child)
-
-    @classmethod
-    def list(cls, **kwargs) -> Generator[Self | dict]:  # type: ignore[override]
-        yield from as_sync_generator(cls.async_list)(**kwargs)
-
 
 ## v1 objects
 
 
-class Binding(APIObject):
+class BaseBinding(BaseAPIObject):
     """A Kubernetes Binding."""
 
     version = "v1"
@@ -1032,7 +488,7 @@ class Binding(APIObject):
     namespaced = True
 
 
-class ComponentStatus(APIObject):
+class BaseComponentStatus(BaseAPIObject):
     """A Kubernetes ComponentStatus."""
 
     version = "v1"
@@ -1043,7 +499,7 @@ class ComponentStatus(APIObject):
     namespaced = False
 
 
-class ConfigMap(APIObject):
+class BaseConfigMap(BaseAPIObject):
     """A Kubernetes ConfigMap."""
 
     version = "v1"
@@ -1063,7 +519,7 @@ class ConfigMap(APIObject):
         self.raw["data"] = value
 
 
-class Endpoints(APIObject):
+class BaseEndpoints(BaseAPIObject):
     """A Kubernetes Endpoints."""
 
     version = "v1"
@@ -1074,7 +530,7 @@ class Endpoints(APIObject):
     namespaced = True
 
 
-class Event(APIObject):
+class BaseEvent(BaseAPIObject):
     """A Kubernetes Event."""
 
     version = "v1"
@@ -1085,7 +541,7 @@ class Event(APIObject):
     namespaced = True
 
 
-class LimitRange(APIObject):
+class BaseLimitRange(BaseAPIObject):
     """A Kubernetes LimitRange."""
 
     version = "v1"
@@ -1096,7 +552,7 @@ class LimitRange(APIObject):
     namespaced = True
 
 
-class Namespace(APIObject):
+class BaseNamespace(BaseAPIObject):
     """A Kubernetes Namespace."""
 
     version = "v1"
@@ -1107,7 +563,7 @@ class Namespace(APIObject):
     namespaced = False
 
 
-class Node(APIObject):
+class BaseNode(BaseAPIObject):
     """A Kubernetes Node."""
 
     version = "v1"
@@ -1123,32 +579,15 @@ class Node(APIObject):
             return self.raw["spec"]["unschedulable"]
         return False
 
-    async def cordon(self) -> None:
-        """Cordon the node.
+    @property
+    def taints(self) -> Box:
+        """Labels of the Kubernetes resource."""
+        try:
+            return self.raw["spec"]["taints"]
+        except KeyError:
+            return Box({})
 
-        This will mark the node as unschedulable.
-        """
-        return await self.async_cordon()
-
-    async def async_cordon(self) -> None:
-        await self.async_patch({"spec": {"unschedulable": True}})
-
-    async def uncordon(self) -> None:
-        """Uncordon the node.
-
-        This will mark the node as schedulable.
-        """
-        return await self.async_uncordon()
-
-    async def async_uncordon(self) -> None:
-        await self.async_patch({"spec": {"unschedulable": False}})
-
-    async def taint(self, key: str, value: str, *, effect: str) -> None:
-        """Taint a node."""
-        return await self.async_taint(key, value, effect=effect)
-
-    async def async_taint(self, key: str, value: str, *, effect: str) -> None:
-        await self.async_refresh()
+    def _taints_patch(self, key: str, value: str, effect: str) -> dict:
         if effect.endswith("-"):
             # Remove taint with key
             effect = effect[:-1]
@@ -1160,19 +599,10 @@ class Node(APIObject):
             taints = list(self.taints) + [
                 {"key": key, "value": value, "effect": effect}
             ]
-
-        await self.async_patch({"spec": {"taints": taints}})
-
-    @property
-    def taints(self) -> Box:
-        """Labels of the Kubernetes resource."""
-        try:
-            return self.raw["spec"]["taints"]
-        except KeyError:
-            return Box({})
+        return {"spec": {"taints": taints}}
 
 
-class PersistentVolumeClaim(APIObject):
+class BasePersistentVolumeClaim(BaseAPIObject):
     """A Kubernetes PersistentVolumeClaim."""
 
     version = "v1"
@@ -1183,7 +613,7 @@ class PersistentVolumeClaim(APIObject):
     namespaced = True
 
 
-class PersistentVolume(APIObject):
+class BasePersistentVolume(BaseAPIObject):
     """A Kubernetes PersistentVolume."""
 
     version = "v1"
@@ -1194,7 +624,7 @@ class PersistentVolume(APIObject):
     namespaced = False
 
 
-class Pod(APIObject):
+class BasePod(BaseAPIObject):
     """A Kubernetes Pod."""
 
     version = "v1"
@@ -1204,9 +634,7 @@ class Pod(APIObject):
     singular = "pod"
     namespaced = True
 
-    async def async_ready(self) -> bool:
-        """Check if the pod is ready."""
-        await self.async_refresh()
+    def _is_ready(self) -> bool:
         conditions = list_dict_unpack(
             self.status.get("conditions", []),
             key="type",
@@ -1219,12 +647,8 @@ class Pod(APIObject):
             and conditions.get("ContainersReady", "False") == "True"
         )
 
-    async def ready(self) -> bool:
-        """Check if the pod is ready."""
-        return await self.async_ready()
-
-    async def logs(
-        self,
+    @staticmethod
+    def _logs_params(
         container=None,
         pretty=None,
         previous=False,
@@ -1234,82 +658,8 @@ class Pod(APIObject):
         tail_lines=None,
         limit_bytes=None,
         follow=False,
-        timeout=3600,
-    ) -> AsyncGenerator[str]:
-        async for line in self.async_logs(
-            container=container,
-            pretty=pretty,
-            previous=previous,
-            since_seconds=since_seconds,
-            since_time=since_time,
-            timestamps=timestamps,
-            tail_lines=tail_lines,
-            limit_bytes=limit_bytes,
-            follow=follow,
-            timeout=timeout,
-        ):
-            yield line
-
-    async def async_logs(
-        self,
-        container=None,
-        pretty=None,
-        previous=False,
-        since_seconds=None,
-        since_time=None,
-        timestamps=False,
-        tail_lines=None,
-        limit_bytes=None,
-        follow=False,
-        timeout=3600,
-    ) -> AsyncGenerator[str]:
-        """Streams logs from a Pod.
-
-        Args:
-            container:
-                The container to get logs from. Defaults to the first container in the Pod.
-            pretty:
-                If True, return pretty logs. Defaults to False.
-            previous:
-                If True, return previous terminated container logs. Defaults to False.
-            since_seconds:
-                If set, return logs since this many seconds ago.
-            since_time:
-                If set, return logs since this time.
-            timestamps:
-                If True, prepend each log line with a timestamp. Defaults to False.
-            tail_lines:
-                If set, return this many lines from the end of the logs.
-            limit_bytes:
-                If set, return this many bytes from the end of the logs.
-            follow:
-                If True, follow the logs until the timeout is reached. Defaults to False.
-            timeout:
-                If following timeout after this many seconds. Set to None to disable timeout.
-
-        Returns:
-            An async generator yielding log lines.
-
-
-        Example:
-            >>> from kr8s.objects import Pod
-            >>> pod = Pod.get("my-pod")
-            >>> for line in pod.logs():
-            ...     print(line)
-
-            We can also follow logs as they are generated, the generator will yield a new log line as
-            it is generated by the Pod. This blocks indefinitely so we can set a timeout to break
-            after some period of time, the default is ``3600`` (1hr) but can be set to ``None`` to
-            disable the timeout.
-
-            >>> from kr8s.objects import Pod
-            >>> pod = Pod.get("my-pod", namespace="ns")
-            >>> for line in pod.logs(follow=True, timeout=60):
-            ...     # Will continue streaming logs until 60 seconds or the Pod is terminated
-            ...     print(line)
-
-        """
-        params: dict[Any, Any] = {}
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {}
         if follow:
             params["follow"] = "true"
         if container is not None:
@@ -1328,156 +678,7 @@ class Pod(APIObject):
             params["tailLines"] = int(tail_lines)
         if limit_bytes is not None:
             params["limitBytes"] = int(limit_bytes)
-
-        with contextlib.suppress(httpx.ReadTimeout):
-            assert self.api
-            async with self.api.call_api(
-                "GET",
-                version=self.version,
-                url=f"{self.endpoint}/{self.name}/log",
-                namespace=self.namespace,
-                params=params,
-                stream=True,
-                timeout=timeout,
-            ) as resp:
-                async for line in resp.aiter_lines():
-                    yield line
-
-    def portforward(
-        self,
-        remote_port: int,
-        local_port: LocalPortType = "match",
-        address: list[str] | str = "127.0.0.1",
-    ) -> AsyncPortForward:
-        """Port forward a pod.
-
-        Returns an instance of :class:`kr8s.portforward.PortForward` for this Pod.
-
-        Args:
-            remote_port:
-                The port on the Pod to forward to.
-            local_port:
-                The local port to listen on. Defaults to ``"match"``, which will match the ``remote_port``.
-                Set to ``"auto"`` or ``None`` to find an available high port.
-                Set to an ``int`` to specify a specific port.
-            address:
-                List of addresses or address to listen on. Defaults to ["127.0.0.1"], will listen only on 127.0.0.1.
-
-        Example:
-            This can be used as a an async context manager or with explicit start/stop methods.
-
-            Context manager:
-
-            >>> async with pod.portforward(8888) as port:
-            ...     print(f"Forwarding to port {port}")
-            ...     # Do something with port 8888
-
-
-            Explict start/stop:
-
-            >>> pf = pod.portforward(8888)
-            >>> await pf.start()
-            >>> print(f"Forwarding to port {pf.local_port}")
-            >>> # Do something with port 8888
-            >>> await pf.stop()
-
-            Explict bind address:
-
-            >>> async with pod.PortForward(8888, address=["127.0.0.1", "10.20.0.1"]) as port:
-            ...     print(f"Forwarding to port {port}")
-            ...     # Do something with port 8888 on the Pod, port will be bind to 127.0.0.1 and 10.20.0.1
-
-        """
-        if isinstance(address, str):
-            address = [address]
-        if self._asyncio:
-            return AsyncPortForward(self, remote_port, local_port, address)
-        return SyncPortForward(self, remote_port, local_port, address)
-
-    async def async_exec(
-        self,
-        command: list[str],
-        *,
-        container: str | None = None,
-        stdin: str | BinaryIO | None = None,
-        stdout: BinaryIO | None = None,
-        stderr: BinaryIO | None = None,
-        check: bool = True,
-        capture_output: bool = True,
-        timeout: int | None = None,
-    ) -> CompletedExec:
-        while not await self.async_ready():
-            await anyio.sleep(0.1)
-
-        ex = Exec(
-            self,
-            command,
-            container=container,
-            stdout=stdout,
-            stderr=stderr,
-            stdin=stdin,
-            check=check,
-            capture_output=capture_output,
-            timeout=timeout,
-        )
-        async with ex.run() as process:
-            await process.wait()
-            return process.as_completed()
-
-    async def exec(
-        self,
-        command: list[str],
-        *,
-        container: str | None = None,
-        stdin: str | BinaryIO | None = None,
-        stdout: BinaryIO | None = None,
-        stderr: BinaryIO | None = None,
-        check: bool = True,
-        capture_output: bool = True,
-        timeout: int | None = None,
-    ) -> CompletedExec:
-        """Run a command in a container and wait until it completes.
-
-        Behaves like :func:`subprocess.run`.
-
-        Args:
-            command:
-                Command to execute.
-            container:
-                Container to execute the command in.
-            stdin:
-                If set, read stdin to the container.
-            stdout:
-                If set, write stdout to the provided writable stream object.
-            stderr:
-                If set, write stderr to the provided writable stream object.
-            check:
-                If True, raise an exception if the command fails.
-            capture_output:
-                If True, store stdout and stderr from the container in an attribute.
-            timeout:
-                If set, timeout for recieving bytes.
-
-        Returns:
-            A :class:`kr8s._exec.CompletedExec` object.
-
-        Example:
-            >>> from kr8s.objects import Pod
-            >>> pod = Pod.get("my-pod")
-            >>> ex = await pod.exec(["ls", "-l"])
-            >>> print(ex.stdout)
-            >>> print(ex.stderr)
-        """
-        return await self.async_exec(
-            command,
-            container=container,
-            stdin=stdin,
-            stdout=stdout,
-            stderr=stderr,
-            check=check,
-            capture_output=capture_output,
-            timeout=timeout,
-        )
+        return params
 
     @classmethod
     def gen(
@@ -1577,41 +778,14 @@ class Pod(APIObject):
             )
         )
 
-    async def tolerate(
+    def _tolerations_patch(
         self,
         key: str,
-        *,
         operator: str,
         effect: str,
-        value: str | None = None,
-        toleration_seconds: int | None = None,
-    ):
-        """Add a toleration to the Pod.
-
-        Args:
-            key (str): Key of the taint to tolerate.
-            operator (str): Toleration operator.
-            effect (str): Specifies the effect of the taint to tolerate.
-            value (str): Value of taint to tolerate.
-            toleration_seconds (str): Toleration seconds.
-        """
-        return await self.async_tolerate(
-            key,
-            operator=operator,
-            effect=effect,
-            value=value,
-            toleration_seconds=toleration_seconds,
-        )
-
-    async def async_tolerate(
-        self,
-        key: str,
-        *,
-        operator: str,
-        effect: str,
-        value: str | None = None,
-        toleration_seconds: int | None = None,
-    ):
+        value: str | None,
+        toleration_seconds: int | None,
+    ) -> dict:
         new_toleration: dict = {"key": key, "operator": operator, "effect": effect}
         if value is not None:
             new_toleration["value"] = value
@@ -1620,8 +794,7 @@ class Pod(APIObject):
             new_toleration["tolerationSeconds"] = toleration_seconds
 
         self.tolerations.append(new_toleration)
-
-        await self.async_patch({"spec": {"tolerations": self.tolerations}})
+        return {"spec": {"tolerations": self.tolerations}}
 
     @property
     def tolerations(self) -> Box:
@@ -1632,7 +805,7 @@ class Pod(APIObject):
             return Box([])
 
 
-class PodTemplate(APIObject):
+class BasePodTemplate(BaseAPIObject):
     """A Kubernetes PodTemplate."""
 
     version = "v1"
@@ -1643,7 +816,7 @@ class PodTemplate(APIObject):
     namespaced = True
 
 
-class ReplicationController(APIObject):
+class BaseReplicationController(BaseAPIObject):
     """A Kubernetes ReplicationController."""
 
     version = "v1"
@@ -1654,12 +827,7 @@ class ReplicationController(APIObject):
     namespaced = True
     scalable = True
 
-    async def ready(self):
-        """Check if the deployment is ready."""
-        return await self.async_ready()
-
-    async def async_ready(self):
-        await self.async_refresh()
+    def _is_ready(self) -> bool:
         return (
             self.raw["status"].get("observedGeneration", 0)
             >= self.raw["metadata"]["generation"]
@@ -1667,7 +835,7 @@ class ReplicationController(APIObject):
         )
 
 
-class ResourceQuota(APIObject):
+class BaseResourceQuota(BaseAPIObject):
     """A Kubernetes ResourceQuota."""
 
     version = "v1"
@@ -1678,7 +846,7 @@ class ResourceQuota(APIObject):
     namespaced = True
 
 
-class Secret(APIObject):
+class BaseSecret(BaseAPIObject):
     """A Kubernetes Secret."""
 
     version = "v1"
@@ -1698,7 +866,7 @@ class Secret(APIObject):
         self.raw["data"] = value
 
 
-class ServiceAccount(APIObject):
+class BaseServiceAccount(BaseAPIObject):
     """A Kubernetes ServiceAccount."""
 
     version = "v1"
@@ -1709,7 +877,7 @@ class ServiceAccount(APIObject):
     namespaced = True
 
 
-class Service(APIObject):
+class BaseService(BaseAPIObject):
     """A Kubernetes Service."""
 
     version = "v1"
@@ -1719,148 +887,27 @@ class Service(APIObject):
     singular = "service"
     namespaced = True
 
-    async def proxy_http_request(
-        self, method: str, path: str, port: int | None = None, **kwargs: Any
-    ) -> httpx.Response:
-        """Issue a HTTP request with specific HTTP method to proxy of a Service.
-
-        Args:
-            method: HTTP method to use.
-            path: Path to proxy.
-            port: Port to proxy to. If not specified, the first port in the
-                Service's spec will be used.
-            **kwargs: Additional keyword arguments to pass to the API call.
-        """
-        return await self.async_proxy_http_request(method, path, port, **kwargs)
-
-    async def async_proxy_http_request(
-        self, method: str, path: str, port: int | None = None, **kwargs: Any
-    ) -> httpx.Response:
+    def _proxy_url(self, path: str, port: int | None) -> str:
         if port is None:
             port = self.raw["spec"]["ports"][0]["port"]
-        assert self.api
-        async with self.api.call_api(
-            method,
-            version=self.version,
-            url=f"{self.endpoint}/{self.name}:{port}/proxy/{path}",
-            namespace=self.namespace,
-            **kwargs,
-        ) as response:
-            return response
+        return f"{self.endpoint}/{self.name}:{port}/proxy/{path}"
 
-    async def proxy_http_get(
-        self, path: str, port: int | None = None, **kwargs
-    ) -> httpx.Response:
-        return await self.async_proxy_http_request("GET", path, port, **kwargs)
+    @property
+    def _pod_selector(self) -> str:
+        return dict_to_selector(self.spec["selector"])
 
-    async def proxy_http_post(
-        self, path: str, port: int | None = None, **kwargs
-    ) -> None:
-        await self.async_proxy_http_request("POST", path, port, **kwargs)
-
-    async def proxy_http_put(
-        self, path: str, port: int | None = None, **kwargs
-    ) -> httpx.Response:
-        return await self.async_proxy_http_request("PUT", path, port, **kwargs)
-
-    async def proxy_http_delete(
-        self, path: str, port: int | None = None, **kwargs
-    ) -> httpx.Response:
-        return await self.async_proxy_http_request("DELETE", path, port, **kwargs)
-
-    async def ready_pods(self) -> list[Pod]:
-        """Return a list of ready Pods for this Service."""
-        return await self.async_ready_pods()
-
-    async def async_ready_pods(self) -> list[Pod]:
-        """Return a list of ready Pods for this Service."""
-        assert self.api
-        pods = [
-            pod
-            async for pod in self.api.async_get(
-                "pods",
-                label_selector=dict_to_selector(self.spec["selector"]),
-                namespace=self.namespace,
-            )
-        ]
-        if isinstance(pods, Pod):
-            pods = [pods]
-        elif isinstance(pods, list) and all(isinstance(pod, Pod) for pod in pods):
-            # The all(isinstance(...) for ...) check doesn't seem to narrow the type
-            # correctly in pyright so we need to explicitly use cast
-            pods = cast(list[Pod], pods)
-        else:
-            raise TypeError(f"Unexpected type {type(pods)} returned from API")
-        return [pod for pod in pods if await pod.async_ready()]
-
-    async def ready(self) -> bool:
-        """Check if the service is ready."""
-        return await self.async_ready()
-
-    async def async_ready(self) -> bool:
-        await self.async_refresh()
-
-        # If the service is of type LoadBalancer, check if it has endpoints
-        if (
+    def _has_load_balancer_ingress(self) -> bool:
+        """Whether the Service is ready to receive traffic from its load balancer, if it has one."""
+        return not (
             self.spec.type == "LoadBalancer"
             and len(self.status.loadBalancer.ingress or []) == 0
-        ):
-            return False
-
-        # Check there is at least one Pod in service
-        pods = await self.async_ready_pods()
-        return len(pods) > 0
-
-    def portforward(
-        self,
-        remote_port: int,
-        local_port: LocalPortType = "match",
-        address: str | list[str] = "127.0.0.1",
-    ) -> AsyncPortForward:
-        """Port forward a service.
-
-        Returns an instance of :class:`kr8s.portforward.PortForward` for this Service.
-
-        Args:
-            remote_port:
-                The port on the Pod to forward to.
-            local_port:
-                The local port to listen on. Defaults to ``"match"``, which will match the ``remote_port``.
-                Set to ``"auto"`` or ``None`` to find an available high port.
-                Set to an ``int`` to specify a specific port.
-            address:
-                List of addresses or address to listen on. Defaults to ["127.0.0.1"], will listen only on 127.0.0.1.
-
-        Example:
-            This can be used as a an async context manager or with explicit start/stop methods.
-
-            Context manager:
-
-            >>> async with service.portforward(8888) as port:
-            ...     print(f"Forwarding to port {port}")
-            ...     # Do something with port 8888
-
-
-            Explict start/stop:
-
-            >>> pf = service.portforward(8888)
-            >>> await pf.start()
-            >>> print(f"Forwarding to port {pf.local_port}")
-            >>> # Do something with port 8888
-            >>> await pf.stop()
-
-        """
-        if isinstance(address, str):
-            address = [address]
-        if self._asyncio:
-            return AsyncPortForward(self, remote_port, local_port, address)
-        return SyncPortForward(self, remote_port, local_port, address)
+        )
 
 
 ## apps/v1 objects
 
 
-class ControllerRevision(APIObject):
+class BaseControllerRevision(BaseAPIObject):
     """A Kubernetes ControllerRevision."""
 
     version = "apps/v1"
@@ -1871,7 +918,7 @@ class ControllerRevision(APIObject):
     namespaced = True
 
 
-class DaemonSet(APIObject):
+class BaseDaemonSet(BaseAPIObject):
     """A Kubernetes DaemonSet."""
 
     version = "apps/v1"
@@ -1882,7 +929,7 @@ class DaemonSet(APIObject):
     namespaced = True
 
 
-class Deployment(APIObject):
+class BaseDeployment(BaseAPIObject):
     """A Kubernetes Deployment."""
 
     version = "apps/v1"
@@ -1893,44 +940,11 @@ class Deployment(APIObject):
     namespaced = True
     scalable = True
 
-    async def ready_pods(self) -> list[Pod]:
-        """Return a list of Pods for this Deployment."""
-        return await self.async_pods(ready=True)
+    @property
+    def _pod_selector(self) -> str:
+        return dict_to_selector(self.spec["selector"]["matchLabels"])
 
-    async def async_ready_pods(self) -> list[Pod]:
-        return await self.async_pods(ready=True)
-
-    async def pods(self) -> list[Pod]:
-        """Return a list of Pods for this Deployment."""
-        return await self.async_pods()
-
-    async def async_pods(self, ready: bool = False) -> list[Pod]:
-        """Return a list of Pods for this Deployment."""
-        assert self.api
-        pods = [
-            pod
-            async for pod in self.api.async_get(
-                "pods",
-                label_selector=dict_to_selector(self.spec["selector"]["matchLabels"]),
-                namespace=self.namespace,
-            )
-        ]
-        if all(isinstance(pod, Pod) for pod in pods):
-            # The all(isinstance(...) for ...) check doesn't seem to narrow the type
-            # correctly in pyright so we need to explicitly use cast
-            pods = cast(list[Pod], pods)
-        else:
-            raise TypeError(f"Unexpected type {type(pods)} returned from API")
-        if ready:
-            return [pod for pod in pods if await pod.async_ready()]
-        return pods
-
-    async def ready(self) -> bool:
-        """Check if the deployment is ready."""
-        return await self.async_ready()
-
-    async def async_ready(self) -> bool:
-        await self.async_refresh()
+    def _is_ready(self) -> bool:
         return (
             self.raw["status"].get("observedGeneration", 0)
             >= self.raw["metadata"]["generation"]
@@ -1938,7 +952,7 @@ class Deployment(APIObject):
         )
 
 
-class ReplicaSet(APIObject):
+class BaseReplicaSet(BaseAPIObject):
     """A Kubernetes ReplicaSet."""
 
     version = "apps/v1"
@@ -1950,7 +964,7 @@ class ReplicaSet(APIObject):
     scalable = True
 
 
-class StatefulSet(APIObject):
+class BaseStatefulSet(BaseAPIObject):
     """A Kubernetes StatefulSet."""
 
     version = "apps/v1"
@@ -1965,7 +979,7 @@ class StatefulSet(APIObject):
 ## autoscaling/v1 objects
 
 
-class HorizontalPodAutoscaler(APIObject):
+class BaseHorizontalPodAutoscaler(BaseAPIObject):
     """A Kubernetes HorizontalPodAutoscaler."""
 
     version = "autoscaling/v2"
@@ -1979,7 +993,7 @@ class HorizontalPodAutoscaler(APIObject):
 ## batch/v1 objects
 
 
-class CronJob(APIObject):
+class BaseCronJob(BaseAPIObject):
     """A Kubernetes CronJob."""
 
     version = "batch/v1"
@@ -1990,7 +1004,7 @@ class CronJob(APIObject):
     namespaced = True
 
 
-class Job(APIObject):
+class BaseJob(BaseAPIObject):
     """A Kubernetes Job."""
 
     version = "batch/v1"
@@ -2006,7 +1020,7 @@ class Job(APIObject):
 ## networking.k8s.io/v1 objects
 
 
-class IngressClass(APIObject):
+class BaseIngressClass(BaseAPIObject):
     """A Kubernetes IngressClass."""
 
     version = "networking.k8s.io/v1"
@@ -2017,7 +1031,7 @@ class IngressClass(APIObject):
     namespaced = False
 
 
-class Ingress(APIObject):
+class BaseIngress(BaseAPIObject):
     """A Kubernetes Ingress."""
 
     version = "networking.k8s.io/v1"
@@ -2028,7 +1042,7 @@ class Ingress(APIObject):
     namespaced = True
 
 
-class NetworkPolicy(APIObject):
+class BaseNetworkPolicy(BaseAPIObject):
     """A Kubernetes NetworkPolicy."""
 
     version = "networking.k8s.io/v1"
@@ -2039,7 +1053,7 @@ class NetworkPolicy(APIObject):
     namespaced = True
 
 
-class IPAddress(APIObject):
+class BaseIPAddress(BaseAPIObject):
     """A Kubernetes IPAddress."""
 
     version = "networking.k8s.io/v1"
@@ -2050,7 +1064,7 @@ class IPAddress(APIObject):
     namespaced = False
 
 
-class ServiceCIDR(APIObject):
+class BaseServiceCIDR(BaseAPIObject):
     """A Kubernetes ServiceCIDR."""
 
     version = "networking.k8s.io/v1"
@@ -2064,7 +1078,7 @@ class ServiceCIDR(APIObject):
 ## policy/v1 objects
 
 
-class PodDisruptionBudget(APIObject):
+class BasePodDisruptionBudget(BaseAPIObject):
     """A Kubernetes PodDisruptionBudget."""
 
     version = "policy/v1"
@@ -2078,7 +1092,7 @@ class PodDisruptionBudget(APIObject):
 ## rbac.authorization.k8s.io/v1 objects
 
 
-class ClusterRoleBinding(APIObject):
+class BaseClusterRoleBinding(BaseAPIObject):
     """A Kubernetes ClusterRoleBinding."""
 
     version = "rbac.authorization.k8s.io/v1"
@@ -2089,7 +1103,7 @@ class ClusterRoleBinding(APIObject):
     namespaced = False
 
 
-class ClusterRole(APIObject):
+class BaseClusterRole(BaseAPIObject):
     """A Kubernetes ClusterRole."""
 
     version = "rbac.authorization.k8s.io/v1"
@@ -2100,7 +1114,7 @@ class ClusterRole(APIObject):
     namespaced = False
 
 
-class RoleBinding(APIObject):
+class BaseRoleBinding(BaseAPIObject):
     """A Kubernetes RoleBinding."""
 
     version = "rbac.authorization.k8s.io/v1"
@@ -2111,7 +1125,7 @@ class RoleBinding(APIObject):
     namespaced = True
 
 
-class Role(APIObject):
+class BaseRole(BaseAPIObject):
     """A Kubernetes Role."""
 
     version = "rbac.authorization.k8s.io/v1"
@@ -2125,7 +1139,7 @@ class Role(APIObject):
 ## apiextensions.k8s.io/v1 objects
 
 
-class CustomResourceDefinition(APIObject):
+class BaseCustomResourceDefinition(BaseAPIObject):
     """A Kubernetes CustomResourceDefinition."""
 
     version = "apiextensions.k8s.io/v1"
@@ -2139,7 +1153,7 @@ class CustomResourceDefinition(APIObject):
 ## meta.k8s.io/v1 objects
 
 
-class Table(APIObject):
+class BaseTable(BaseAPIObject):
     """A Kubernetes Table."""
 
     version = "meta.k8s.io/v1"
@@ -2160,11 +1174,22 @@ class Table(APIObject):
         return self.raw["columnDefinitions"]
 
 
+def _api_object_class(asyncio: bool) -> type[BaseAPIObject]:
+    """Return the sync or async ``APIObject`` that all objects of that flavour subclass."""
+    if asyncio:
+        from kr8s.asyncio.objects import APIObject as AsyncAPIObject
+
+        return AsyncAPIObject
+    from kr8s.objects import APIObject as SyncAPIObject
+
+    return SyncAPIObject
+
+
 def get_class(
     kind: str,
     version: str | None = None,
     _asyncio: bool = True,
-) -> type[APIObject]:
+) -> type[BaseAPIObject]:
     """Get an APIObject subclass by kind and version.
 
     Args:
@@ -2194,17 +1219,15 @@ def get_class(
         for subcls in cls.__subclasses__():
             yield from _walk_subclasses(subcls)
 
-    for cls in _walk_subclasses(APIObject):
+    for cls in _walk_subclasses(_api_object_class(_asyncio)):
         if not hasattr(cls, "version"):
             continue
         if "/" in cls.version:
             cls_group, cls_version = cls.version.split("/")
         else:
             cls_group, cls_version = None, cls.version
-        if (
-            hasattr(cls, "kind")
-            and cls._asyncio == _asyncio
-            and (cls.kind == kind or cls.singular == kind or cls.plural == kind)
+        if hasattr(cls, "kind") and (
+            cls.kind == kind or cls.singular == kind or cls.plural == kind
         ):
             if (group is None or cls_group == group) and (
                 version is None or cls_version == version
@@ -2236,7 +1259,7 @@ def new_class(
     scalable: bool | None = None,
     scalable_spec: str | None = None,
     plural: str | None = None,
-) -> type[APIObject]:
+) -> type[BaseAPIObject]:
     """Create a new APIObject subclass.
 
     Args:
@@ -2256,36 +1279,28 @@ def new_class(
     if version is None:
         version = "v1"
     plural = plural or kind.lower() + "s"
-    construct_args = {
-        "kind": kind,
-        "version": version,
-        "_asyncio": asyncio,
-        "endpoint": plural.lower(),
-        "plural": plural.lower(),
-        "singular": kind.lower(),
-        "namespaced": namespaced,
-        "scalable": scalable or False,
-        "scalable_spec": scalable_spec or "replicas",
-    }
-    if asyncio:
-        return type(kind, (APIObject,), construct_args)
-    else:
-        return type(
-            kind,
-            (
-                APIObjectSyncMixin,
-                APIObject,
-            ),
-            construct_args,
-        )
+    return type(
+        kind,
+        (_api_object_class(asyncio),),
+        {
+            "kind": kind,
+            "version": version,
+            "endpoint": plural.lower(),
+            "plural": plural.lower(),
+            "singular": kind.lower(),
+            "namespaced": namespaced,
+            "scalable": scalable or False,
+            "scalable_spec": scalable_spec or "replicas",
+        },
+    )
 
 
 def object_from_spec(
     spec: dict,
-    api: Api | None = None,
+    api: BaseApi | None = None,
     allow_unknown_type: bool = False,
     _asyncio: bool = True,
-) -> APIObject:
+) -> BaseAPIObject:
     """Create an APIObject from a Kubernetes resource spec.
 
     Args:
@@ -2310,26 +1325,8 @@ def object_from_spec(
     return cls(spec, api=api)
 
 
-async def object_from_name_type(
-    name: str,
-    namespace: str | None = None,
-    api: Api | None = None,
-    _asyncio: bool = True,
-) -> APIObject:
-    """Create an APIObject from a Kubernetes resource name.
-
-    Args:
-        name: A Kubernetes resource name.
-        namespace: The namespace of the resource.
-        api: An optional API instance to use.
-        _asyncio: Whether to use asyncio or not.
-
-    Returns:
-        A corresponding APIObject subclass instance.
-
-    Raises:
-        ValueError: If the resource kind or API version is not supported.
-    """
+def parse_name_type(name: str) -> tuple[str, str, str | None]:
+    """Split a ``resource/name`` string into ``(name, kind, version)``."""
     if "/" not in name:
         raise ValueError(f"Invalid name: {name}. Expecting format of 'resource/name'.")
     resource_type, name = name.split("/")
@@ -2339,50 +1336,16 @@ async def object_from_name_type(
     else:
         kind = resource_type
         version = None
-    cls = get_class(kind, version, _asyncio=_asyncio)
-    return await cls.get(name, namespace=namespace, api=api)
+    return name, kind, version
 
 
-async def objects_from_files(
-    path: str | pathlib.Path,
-    api: Api | None = None,
-    recursive: bool = False,
-    _asyncio: bool = True,
-) -> list[APIObject]:
-    """Create APIObjects from Kubernetes resource files.
-
-    Args:
-        path: A path to a Kubernetes resource file or directory of resource files.
-        api: An optional API instance to use.
-        recursive: Whether to recursively search for resource files in subdirectories.
-        _asyncio: Whether to use asyncio or not.
-
-    Returns:
-        A list of APIObject subclass instances.
-
-    Raises:
-        ValueError: If the resource kind or API version is not supported.
-    """
+def find_object_files(path, recursive: bool = False) -> list:
+    """Return the YAML files at a path, which may be a file or a directory."""
     path = pathlib.Path(path)
     if path.is_dir():
         pattern = "**/*.yaml" if recursive else "*.yaml"
-        files = [f for f in path.glob(pattern) if f.is_file()]
-    else:
-        files = [path]
-    if not api:
-        api = await kr8s.asyncio.api(_asyncio=_asyncio)
-    objects = []
-    for file in files:
-        with open(file) as f:
-            for doc in yaml.safe_load_all(f):
-                if doc is not None:
-                    obj = object_from_spec(
-                        doc, api=api, allow_unknown_type=True, _asyncio=_asyncio
-                    )
-                    if _asyncio:
-                        await obj
-                    objects.append(obj)
-    return objects
+        return [f for f in path.glob(pattern) if f.is_file()]
+    return [path]
 
 
 def parse_kind(kind: str) -> tuple[str, str, str]:

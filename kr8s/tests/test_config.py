@@ -7,7 +7,10 @@ import pytest
 import yaml
 from jsonpath import JSONPointerKeyError
 
-from kr8s._config import KubeConfig, KubeConfigSet
+from kr8s._config import AsyncKubeConfig as KubeConfig
+from kr8s._config import AsyncKubeConfigSet as KubeConfigSet
+from kr8s._config import KubeConfig as SyncKubeConfig
+from kr8s._config import KubeConfigSet as SyncKubeConfigSet
 
 
 @pytest.fixture
@@ -181,3 +184,65 @@ async def test_unset(temp_kubeconfig, cls):
     await config.unset(pointer="/contexts/0/context/foo")
     with pytest.raises(JSONPointerKeyError):
         config.get(pointer="/contexts/0/context/foo")
+
+
+@pytest.mark.parametrize("cls", [SyncKubeConfig, SyncKubeConfigSet])
+def test_sync_kubeconfig_from_dict(temp_kubeconfig, cls):
+    with open(temp_kubeconfig) as fh:
+        config = yaml.safe_load(fh)
+    kubeconfig = cls(config)
+    assert kubeconfig.raw["clusters"] == config["clusters"]
+    assert kubeconfig.raw["contexts"] == config["contexts"]
+
+
+@pytest.mark.parametrize("cls", [SyncKubeConfig, SyncKubeConfigSet])
+def test_sync_rename_context(temp_kubeconfig, cls):
+    config = cls(temp_kubeconfig)
+    context = config.current_context
+    new_context = f"{context}-new"
+    config.rename_context(context, new_context)
+    # Load again from disk to ensure the change was saved
+    config = cls(temp_kubeconfig)
+    assert new_context in [c["name"] for c in config.contexts]
+    assert context not in [c["name"] for c in config.contexts]
+    assert config.current_context == new_context
+    config.rename_context(new_context, context)
+    assert config.current_context == context
+    with pytest.raises(ValueError):
+        config.rename_context("foobar", new_context)
+
+
+@pytest.mark.parametrize("cls", [SyncKubeConfig, SyncKubeConfigSet])
+def test_sync_use_namespace(temp_kubeconfig, cls):
+    config = cls(temp_kubeconfig)
+    current_namespace = config.current_namespace
+    config.use_namespace("kube-system")
+    assert cls(temp_kubeconfig).current_namespace == "kube-system"
+    config.use_namespace(current_namespace)
+
+
+@pytest.mark.parametrize("cls", [SyncKubeConfig, SyncKubeConfigSet])
+def test_sync_set_unset(temp_kubeconfig, cls):
+    config = cls(temp_kubeconfig)
+    config.set(pointer="/contexts/0/context/foo", value="bar")
+    assert cls(temp_kubeconfig).get(pointer="/contexts/0/context/foo") == "bar"
+    config.unset(pointer="/contexts/0/context/foo")
+    with pytest.raises(JSONPointerKeyError):
+        cls(temp_kubeconfig).get(pointer="/contexts/0/context/foo")
+
+
+def test_sync_kubeconfigset_multi_paths(temp_kubeconfig, tmp_path):
+    kubeconfig1 = Path(temp_kubeconfig)
+    kubeconfig2 = Path(tmp_path / "kubeconfig")
+    kubeconfig2.write_bytes(kubeconfig1.read_bytes())
+    config = SyncKubeConfigSet(kubeconfig1, kubeconfig2, "")
+    context = config.get_context(config.current_context)
+    assert config.get_user(context["user"])
+
+
+@pytest.mark.parametrize("cls", [SyncKubeConfig, SyncKubeConfigSet])
+def test_sync_kubeconfig_path_fail(cls, tmp_path):
+    with pytest.raises(ValueError):
+        cls("")
+    with pytest.raises(IsADirectoryError):
+        cls(tmp_path)
