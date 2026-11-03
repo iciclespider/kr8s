@@ -1,6 +1,6 @@
 # Asyncio
 
-`kr8s` is built using async/await under the hood when interacting with the Kubernetes API. However, it exposes a standard synchronous API by default.
+`kr8s` provides both a synchronous and an asynchronous API. The synchronous API is the default.
 
 ```python
 import kr8s
@@ -8,10 +8,10 @@ import kr8s
 pods = kr8s.get("pods")
 ```
 
-The standard API works by creating a background thread with it's own event loop running. Then internally the `kr8s` sync API submits all coroutine calls to this external event loop for execution and then returns the result.
+Like [httpx](https://www.python-httpx.org/), each API does its own I/O. The sync API makes blocking calls with an `httpx2.Client`, and the async API awaits an `httpx2.AsyncClient`. Both are built on shared base classes, so they behave the same and have the same objects, method signatures and return values.
 
 ```{note}
-Running a separate event loop allows you to use the sync API even when already inside an async context without blocking up the existing event loop. The most common situation this happens is when using [IPython](https://ipython.org/) or [Jupyter](https://jupyter.org/) which places your REPL inside a running event loop, but this doesn't mean everyone wants to do async programming in those environments.
+The sync API blocks the thread it is called from. You can still call it from inside an async context, which is common in [IPython](https://ipython.org/) and [Jupyter](https://jupyter.org/) because they run your code inside an event loop. While a sync call is waiting on the Kubernetes API, though, that event loop can't run other tasks. If you're writing async code, use `kr8s.asyncio`.
 ```
 
 ## `kr8s.asyncio` submodule
@@ -25,6 +25,8 @@ pods = [pod async for pod in kr8s.asyncio.get("pods")]
 ```
 
 Submodules including `kr8s.objects` and `kr8s.portforward` also have `asyncio` equivalents at `kr8s.asyncio.objects` and `kr8s.asyncio.portforward`.
+
+The sync and async classes are siblings that share a base class, so a sync object is not an instance of its async equivalent. For example `isinstance(kr8s.objects.Pod(...), kr8s.asyncio.objects.Pod)` is `False`. To check for any `Pod` regardless of API, use the shared base class `kr8s._objects.BasePod`.
 
 ## Documentation examples
 

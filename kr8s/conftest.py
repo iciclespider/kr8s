@@ -13,7 +13,7 @@ import anyio
 import pytest
 import yaml
 
-from kr8s._api import Api
+from kr8s._api import Api, AsyncApi
 from kr8s._testutils import set_env
 
 HERE = Path(__file__).parent.resolve()
@@ -230,3 +230,4 @@ def serviceaccount(k8s_cluster, k8s_token, ns):
 def ensure_new_api_between_tests():
     yield
     Api._instances.clear()
+    AsyncApi._instances.clear()

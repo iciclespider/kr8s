@@ -94,12 +94,26 @@ For situations where there may not be an appropriate method to call or you want 
 
 To make API requests for resources more convenient `call_api` allows building the url via various kwargs.
 
-```{warning}
-The `call_api` method is only available via the [asynchronous API](asyncio). This is because it yields async objects from `httpx2`.
-```
-
 For example to get all pods you could make the following low-level call.
 
+`````{tab-set}
+
+````{tab-item} Sync
+:sync: sync
+```python
+import kr8s
+
+api = kr8s.api()
+with api.call_api("GET", url="pods", namespace="") as r:
+    pods_response = r.json()
+
+for pod in pods_response["items"]:
+    print(pod["metadata"]["name"])
+```
+````
+
+````{tab-item} Async
+:sync: async
 ```python
 import kr8s.asyncio
 
@@ -110,17 +124,39 @@ async with api.call_api("GET", url="pods", namespace="") as r:
 for pod in pods_response["items"]:
     print(pod["metadata"]["name"])
 ```
+````
+
+`````
 
 You can also just set the `base` kwarg with an empty `version` if you want to build the URL yourself.
 
+`````{tab-set}
+
+````{tab-item} Sync
+:sync: sync
+```python
+import kr8s
+
+api = kr8s.api()
+with api.call_api("GET", base="/version", version="") as r:
+    version = r.json()
+print(version)
+```
+````
+
+````{tab-item} Async
+:sync: async
 ```python
 import kr8s.asyncio
 
 api = await kr8s.asyncio.api()
 async with api.call_api("GET", base="/version", version="") as r:
-    version = await r.json()
+    version = r.json()
 print(version)
 ```
+````
+
+`````
 
 ## Timeouts
 

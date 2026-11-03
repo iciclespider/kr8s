@@ -158,6 +158,14 @@ def test_version_sync():
     assert "major" in version
 
 
+def test_sync_api_does_not_start_event_loop_thread():
+    api = kr8s.api()
+    list(api.get("namespaces"))
+    assert not any(
+        thread.name == "Kr8sSyncRunnerThread" for thread in threading.enumerate()
+    )
+
+
 async def test_version_sync_in_async():
     api = kr8s.api()
     version = api.version()
@@ -378,14 +386,14 @@ async def test_api_resources_cache_expires() -> None:
     fetch = AsyncMock(side_effect=[[{"name": "first"}], [{"name": "second"}]])
     with (
         patch.object(api, "_api_resources", None),
-        patch.object(api, "async_api_resources_uncached", fetch),
+        patch.object(api, "api_resources_uncached", fetch),
         patch("kr8s._api.time.monotonic", return_value=1000.0) as monotonic,
     ):
-        assert await api.async_api_resources() == [{"name": "first"}]
+        assert await api.api_resources() == [{"name": "first"}]
         monotonic.return_value += API_RESOURCES_CACHE_TTL - 1
-        assert await api.async_api_resources() == [{"name": "first"}]
+        assert await api.api_resources() == [{"name": "first"}]
         monotonic.return_value += 1
-        assert await api.async_api_resources() == [{"name": "second"}]
+        assert await api.api_resources() == [{"name": "second"}]
     assert fetch.await_count == 2
 
 
@@ -396,12 +404,12 @@ async def test_api_resources_cache_per_instance() -> None:
     fetch1 = AsyncMock(return_value=[{"name": "one"}])
     fetch2 = AsyncMock(return_value=[{"name": "two"}])
     with (
-        patch.object(api1, "async_api_resources_uncached", fetch1),
-        patch.object(api2, "async_api_resources_uncached", fetch2),
+        patch.object(api1, "api_resources_uncached", fetch1),
+        patch.object(api2, "api_resources_uncached", fetch2),
     ):
         for _ in range(2):
-            assert await api1.async_api_resources() == [{"name": "one"}]
-            assert await api2.async_api_resources() == [{"name": "two"}]
+            assert await api1.api_resources() == [{"name": "one"}]
+            assert await api2.api_resources() == [{"name": "two"}]
     fetch1.assert_awaited_once()
     fetch2.assert_awaited_once()
 
@@ -417,9 +425,9 @@ async def test_api_resources_cache_concurrent_fetch_once() -> None:
     results = []
 
     async def get_resources():
-        results.append(await api.async_api_resources())
+        results.append(await api.api_resources())
 
-    with patch.object(api, "async_api_resources_uncached", fetch):
+    with patch.object(api, "api_resources_uncached", fetch):
         async with anyio.create_task_group() as tg:
             for _ in range(5):
                 tg.start_soon(get_resources)
@@ -599,11 +607,11 @@ def test_create_sync(example_pod_spec, example_service_spec):
 )
 async def test_bad_kubernetes_version(version):
     api = await kr8s.asyncio.api()
-    keep = api.async_version
-    api.async_version = AsyncMock(return_value={"gitVersion": version})
+    keep = api.version
+    api.version = AsyncMock(return_value={"gitVersion": version})
     with pytest.warns(UserWarning, match=version):
         await api._check_version()
-    api.async_version = keep
+    api.version = keep
 
 
 @pytest.mark.parametrize(
@@ -617,12 +625,12 @@ async def test_bad_kubernetes_version(version):
 )
 async def test_good_kubernetes_version(version):
     api = await kr8s.asyncio.api()
-    keep = api.async_version
-    api.async_version = AsyncMock(return_value={"gitVersion": version})
+    keep = api.version
+    api.version = AsyncMock(return_value={"gitVersion": version})
     with warnings.catch_warnings(record=True) as w:
         await api._check_version()
         assert w == []
-    api.async_version = keep
+    api.version = keep
 
 
 async def test_crd_caching(example_crd_spec):

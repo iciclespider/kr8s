@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2023-2026, Kr8s Developers (See LICENSE for list)
 # SPDX-License-Identifier: BSD 3-Clause License
 
-from kr8s._api import Api
-from kr8s._objects import APIObject
+from kr8s._api import AsyncApi as Api
+from kr8s._objects import BaseAPIObject as APIObject
 
 from ._api import api as _api
 
@@ -17,7 +17,6 @@ async def get(
     allow_unknown_type: bool = True,
     raw: bool = False,
     api=None,
-    _asyncio=True,
     **kwargs,
 ):
     """Get a resource by name.
@@ -59,8 +58,8 @@ async def get(
         >>> print(pods[0]["metadata"]["name"])
     """
     if api is None:
-        api = await _api(_asyncio=_asyncio)
-    async for resource in api.async_get(
+        api = await _api()
+    async for resource in api.get(
         kind,
         *names,
         namespace=namespace,
@@ -74,10 +73,10 @@ async def get(
         yield resource
 
 
-async def version(api=None, _asyncio=True):
+async def version(api=None):
     if api is None:
-        api = await _api(_asyncio=_asyncio)
-    return await api.async_version()
+        api = await _api()
+    return await api.version()
 
 
 async def watch(
@@ -87,11 +86,10 @@ async def watch(
     field_selector: str | dict | None = None,
     since: str | None = None,
     api=None,
-    _asyncio=True,
 ):
     if api is None:
-        api = await _api(_asyncio=_asyncio)
-    async for t, o in api.async_watch(
+        api = await _api()
+    async for t, o in api.watch(
         kind=kind,
         namespace=namespace,
         label_selector=label_selector,
@@ -101,23 +99,23 @@ async def watch(
         yield (t, o)
 
 
-async def api_resources(api=None, _asyncio=True):
+async def api_resources(api=None):
     if api is None:
-        api = await _api(_asyncio=_asyncio)
-    return await api.async_api_resources()
+        api = await _api()
+    return await api.api_resources()
 
 
-async def whoami(api=None, _asyncio=True):
+async def whoami(api=None):
     if api is None:
-        api = await _api(_asyncio=_asyncio)
-    return await api.async_whoami()
+        api = await _api()
+    return await api.whoami()
 
 
-async def create(resources: list[APIObject], api=None, _asyncio=True):
+async def create(resources: list[APIObject], api=None):
     """Create resources in the Kubernetes cluster."""
     if api is None:
-        api = await _api(_asyncio=_asyncio)
-    return await api.async_create(resources)
+        api = await _api()
+    return await api.create(resources)
 
 
 create.__doc__ = Api.create.__doc__
